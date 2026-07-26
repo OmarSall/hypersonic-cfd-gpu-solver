@@ -48,7 +48,7 @@ State primitive_to_conservative(double rho, double u, double p) {
 }
 
 int main() {
-    const int    N        = 400;
+    const int    N        = 20000;
     const double x_min    = 0.0;
     const double x_max    = 1.0;
     const double dx       = (x_max - x_min) / N;
@@ -61,6 +61,13 @@ int main() {
         U[i] = (x < 0.5) ? primitive_to_conservative(1.0, 0.0, 1.0)
                           : primitive_to_conservative(0.125, 0.0, 0.1);
     }
+
+    // CHANGED: F and U_new are allocated ONCE, before the loop, instead of
+    // being freshly heap-allocated every single iteration. Their contents
+    // get overwritten each step, but the underlying memory is reused --
+    // exactly the "don't allocate inside the hot loop" rule from before.
+    std::vector<State> F(N + 1);
+    std::vector<State> U_new(N + 2);
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -76,17 +83,20 @@ int main() {
         double dt = CFL * dx / Smax;
         if (t + dt > t_final) dt = t_final - t;
 
-        std::vector<State> F(N + 1);
         for (int i = 0; i <= N; ++i)
             F[i] = rusanov_flux(U[i], U[i + 1]);
 
-        std::vector<State> U_new = U;
         for (int i = 1; i <= N; ++i) {
             U_new[i].rho = U[i].rho - (dt / dx) * (F[i].rho - F[i - 1].rho);
             U_new[i].mom = U[i].mom - (dt / dx) * (F[i].mom - F[i - 1].mom);
             U_new[i].E   = U[i].E   - (dt / dx) * (F[i].E   - F[i - 1].E);
         }
-        U = U_new;
+
+        // CHANGED: swap instead of U = U_new (which was a full O(N) copy).
+        // This is the exact same double-buffering trick the GPU version
+        // uses with std::swap(d_U, d_U_new) -- both versions now share the
+        // same structural idiom, not just the same physics.
+        std::swap(U, U_new);
 
         t += dt;
         ++step;
@@ -95,7 +105,7 @@ int main() {
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
-    printf("CPU: %d steps, final t = %f, wall time = %.2f ms\n", step, t, elapsed_ms);
+    printf("CPU (v2, no per-step allocation): %d steps, final t = %f, wall time = %.2f ms\n", step, t, elapsed_ms);
 
     std::ofstream out("sod_result_cpu.csv");
     out << "x,rho,u,p\n";
