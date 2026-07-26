@@ -1,15 +1,7 @@
 // ============================================================================
-// 1D Euler equations solver - Phase 1: CUDA GPU port (initial version)
-// Same physics/numerics as the CPU version (euler_cpu.cpp):
-// Finite Volume Method, Rusanov flux, Sod shock tube validation case.
-//
-// Parallelization strategy: one CUDA thread per grid cell.
-// Each thread reads its own cell and its two neighbors (a 3-point stencil),
-// computes the two interface fluxes, and writes the updated state.
-//
-// Known limitation of this version: the CFL timestep reduction is done by
-// copying the full array back to the host every step (see main()) -- fixed
-// in the next revision by moving the reduction onto the GPU with Thrust.
+// 1D Euler equations solver - Phase 1.5: removed the per-step host<->device
+// round trip by doing the CFL reduction (max wave speed) on the GPU with
+// Thrust instead of copying the whole array back to the CPU every step.
 // ============================================================================
 
 #include <cstdio>
@@ -18,6 +10,9 @@
 #include <chrono>
 #include <fstream>
 #include <cuda_runtime.h>
+#include <thrust/device_ptr.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/functional.h>
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -66,6 +61,16 @@ __device__ __host__ inline State rusanov_flux(const State& UL, const State& UR) 
     return F;
 }
 
+// NEW: turns one State into its local wave speed |u|+c. This is the
+// "unary op" Thrust applies to every cell before reducing with max().
+// Doing it this way means the reduction itself happens entirely on the
+// GPU -- no array ever crosses back to the host mid-loop.
+struct WaveSpeed {
+    __device__ double operator()(const State& s) const {
+        return fabs(velocity(s)) + sound_speed(s);
+    }
+};
+
 __global__ void apply_bc_kernel(State* U, int N) {
     U[0]     = U[1];
     U[N + 1] = U[N];
@@ -91,7 +96,7 @@ State primitive_to_conservative(double rho, double u, double p) {
 }
 
 int main() {
-    const int    N       = 400;
+    const int    N       = 20000;
     const double x_min   = 0.0;
     const double x_max   = 1.0;
     const double dx      = (x_max - x_min) / N;
@@ -121,12 +126,20 @@ int main() {
     while (t < t_final) {
         apply_bc_kernel<<<1, 1>>>(d_U, N);
 
-        // Known bottleneck: full array copied back to host every step just
-        // to compute the CFL-limited timestep. Fixed in the next revision.
-        CUDA_CHECK(cudaMemcpy(h_U, d_U, bytes, cudaMemcpyDeviceToHost));
-        double Smax = 0.0;
-        for (int i = 1; i <= N; ++i)
-            Smax = fmax(Smax, fabs(velocity(h_U[i])) + sound_speed(h_U[i]));
+        // CHANGED: no cudaMemcpy(h_U, d_U, ...) here anymore, and no serial
+        // CPU for-loop over N elements. thrust::transform_reduce launches
+        // its own GPU kernel(s) to apply WaveSpeed to every interior cell
+        // and reduce with max(), entirely on the device. d_U + 1 / d_U + N + 1
+        // restrict the reduction to the interior cells (skipping the two
+        // ghost cells), matching the original loop's `for (i = 1; i <= N; ++i)`.
+        thrust::device_ptr<State> dU_ptr(d_U);
+        double Smax = thrust::transform_reduce(
+            dU_ptr + 1, dU_ptr + N + 1,
+            WaveSpeed(),
+            0.0,
+            thrust::maximum<double>()
+        );
+
         double dt = CFL * dx / Smax;
         if (t + dt > t_final) dt = t_final - t;
 
@@ -143,9 +156,12 @@ int main() {
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
+    // h_U is now touched only twice in the whole program: the initial
+    // upload before the loop, and this one final readback for the CSV --
+    // never inside the 19000+ step loop anymore.
     CUDA_CHECK(cudaMemcpy(h_U, d_U, bytes, cudaMemcpyDeviceToHost));
 
-    printf("GPU: %d steps, final t = %f, wall time = %.2f ms\n", step, t, elapsed_ms);
+    printf("GPU (v2, no per-step memcpy): %d steps, final t = %f, wall time = %.2f ms\n", step, t, elapsed_ms);
 
     std::ofstream out("sod_result_gpu.csv");
     out << "x,rho,u,p\n";
