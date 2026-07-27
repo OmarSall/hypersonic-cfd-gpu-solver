@@ -1,4 +1,3 @@
-%%writefile euler2d_wedge_gpu.cu
 // ============================================================================
 // Task 4: GPU port of the 2D unsplit Euler wedge solver (euler2d_wedge.cpp).
 // Same physics/numerics: Rusanov flux in x and y, forward Euler, staircase-
@@ -152,10 +151,6 @@ __global__ void bc_wall_kernel(State* U, const int* wall_j, int Nx, int Ny,
     for (int j = 0; j <= jw; ++j) U[IDX(i,j,Ny)] = mirror;
 }
 
-__global__ void check_trig(double a) {
-    printf("GPU  cos(2*theta)=%.17e sin(2*theta)=%.17e\n", cos(2*a), sin(2*a));
-}
-
 // One thread per (i,j) fluid cell. Solid cells return immediately -- their
 // U_new slot is left unwritten and gets overwritten by bc_wall_kernel next
 // step, before anything ever reads it (see design note 4 above).
@@ -206,11 +201,6 @@ int main(int argc, char** argv) {
     const double dx = Lx/Nx, dy = Ly/Ny;
     const double x_wedge = 0.5;
     const double theta = 15.0 * M_PI / 180.0;
-
-    printf("CPU  cos(2*theta)=%.17e sin(2*theta)=%.17e\n", std::cos(2*theta), std::sin(2*theta));
-    check_trig<<<1,1>>>(theta);
-    cudaDeviceSynchronize();
-
     const double CFL = 0.45;
 
     const double M1 = 2.0;
